@@ -6,6 +6,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <ESP8266WiFi.h>
 #include <time.h>
+#include <sys/time.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
 #include "secrets.h"
 
 // เวลาไทย UTC+7 (POSIX TZ กลับเครื่องหมาย) ดึงจาก NTP หลังต่อ Wi-Fi ได้
@@ -20,7 +23,7 @@ String nowText(const char* fmt) {
   time_t now = time(nullptr);
   struct tm t;
   localtime_r(&now, &t);
-  char buf[24];
+  char buf[32];  // ISO "%Y-%m-%dT%H:%M:%S+07:00" ยาว 25 ตัว
   strftime(buf, sizeof(buf), fmt, &t);
   return String(buf);
 }
@@ -162,6 +165,108 @@ bool showingResult = false;
 uint32_t countIn = 0;
 uint32_t countOut = 0;
 
+// ---- ส่งผลแตะบัตรไป MECHA-CHECKIN backend ผ่าน WebSocket ----
+// protocol: D:\SCRIPT\WEB\MECHA_TIME_IN\docs\ESP_DEVICE_API.md (แก้ข้อความต้องแก้ backend/services/devices.js ด้วย)
+#define FW_VERSION "1.1.0"
+const bool wsEnabled = sizeof(SERVER_HOST) > 1;  // SERVER_HOST ว่าง = ปิด WS ทำงานออฟไลน์เหมือนเดิม
+
+WebSocketsClient ws;
+bool wsReady = false;   // true หลังได้ hello_ok
+bool wsBadKey = false;  // key/ชื่อเครื่องผิด — ลองใหม่ทุก 60 วิ
+String bootId;          // สุ่มใหม่ทุกบูต ใช้ประกอบ id ของ scan
+uint32_t seq = 0;
+
+// คิวรายการที่ยังไม่ได้ ack (อยู่ใน RAM ไฟดับ = หาย) เต็มแล้วทิ้งอันเก่าสุด
+struct Pending { String id, card, ts; Mode mode; unsigned long sentAt; };  // sentAt 0 = ยังไม่ได้ส่ง
+const byte QUEUE_SIZE = 20;
+Pending pending[QUEUE_SIZE];
+byte pendingCount = 0;
+const unsigned long ACK_TIMEOUT_MS = 5000;  // ส่งแล้วไม่ได้ ack เกินนี้ = ส่งใหม่ (id เดิม server กันซ้ำให้)
+const unsigned long SEND_GAP_MS = 150;      // server รับไม่เกิน 10 ข้อความ/วิ — ส่งของค้างทีละอัน
+
+// ผลบนจอหลังแตะบัตร — อัปเดตเมื่อได้ ack / resolved
+enum ResultStatus { RES_WAITING, RES_NAMED, RES_UNKNOWN, RES_ERROR, RES_OFFLINE };
+const unsigned long ACK_WAIT_MS = 1500;  // ไม่ได้ ack ภายในนี้ = แสดง Saved (offline)
+bool shownIsCard = false;  // false = จอแสดงผลแตะซ้ำอยู่
+String shownCard, shownId, shownName;
+ResultStatus shownStatus = RES_WAITING;
+uint32_t shownCount = 0;
+
+String enqueueScan(const String& uid) {
+  if (pendingCount == QUEUE_SIZE) {
+    Serial.printf("WS: queue full, drop %s\n", pending[0].id.c_str());
+    for (byte i = 1; i < QUEUE_SIZE; i++) pending[i - 1] = pending[i];
+    pendingCount--;
+  }
+  Pending& p = pending[pendingCount++];
+  p.id = bootId + "-" + String(++seq);
+  p.card = uid;
+  p.mode = mode;
+  p.ts = timeValid() ? nowText("%Y-%m-%dT%H:%M:%S+07:00") : String();  // ว่าง = ส่ง null ให้ server ใช้เวลาตัวเอง
+  p.sentAt = 0;
+  return p.id;
+}
+
+void removeFromQueue(const char* id) {
+  for (byte i = 0; i < pendingCount; i++) {
+    if (pending[i].id != id) continue;
+    for (byte j = i + 1; j < pendingCount; j++) pending[j - 1] = pending[j];
+    pendingCount--;
+    return;
+  }
+}
+
+void sendHello() {
+  JsonDocument d;
+  d["t"] = "hello";
+  d["device"] = DEVICE_ID;
+  d["key"] = DEVICE_KEY;
+  d["fw"] = FW_VERSION;
+  d["boot"] = bootId;
+  String s;
+  serializeJson(d, s);
+  ws.sendTXT(s);
+}
+
+void sendScan(Pending& p) {
+  JsonDocument d;
+  d["t"] = "scan";
+  d["id"] = p.id;
+  d["card"] = p.card;  // string เสมอ — ส่งเป็นตัวเลข 0 นำหน้าจะหาย
+  d["mode"] = p.mode == MODE_IN ? "in" : "out";
+  if (p.ts.length()) d["ts"] = p.ts;
+  else d["ts"] = nullptr;
+  String s;
+  serializeJson(d, s);
+  ws.sendTXT(s);
+  p.sentAt = millis() | 1;
+  Serial.printf("WS -> %s\n", s.c_str());
+}
+
+// ส่งทีละรายการ: ที่ยังไม่ได้ส่ง หรือส่งแล้วรอ ack นานเกิน
+void pumpQueue() {
+  static unsigned long lastSendAt = 0;
+  if (!wsReady || millis() - lastSendAt < SEND_GAP_MS) return;
+  for (byte i = 0; i < pendingCount; i++) {
+    Pending& p = pending[i];
+    if (p.sentAt && millis() - p.sentAt < ACK_TIMEOUT_MS) continue;
+    sendScan(p);
+    lastSendAt = millis();
+    return;
+  }
+}
+
+// นาฬิกาสำรองจาก server_time (เวลาไทย "YYYY-MM-DDTHH:MM:SS") เผื่อโรงงานบล็อก NTP
+void setClockFrom(const char* s) {
+  struct tm t = {};
+  if (sscanf(s, "%d-%d-%dT%d:%d:%d", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min, &t.tm_sec) != 6) return;
+  t.tm_year -= 1900;
+  t.tm_mon -= 1;
+  timeval tv = {mktime(&t), 0};  // mktime ใช้ TZ จาก configTime = ตีเป็นเวลาไทย
+  settimeofday(&tv, nullptr);
+  Serial.printf("Clock set from server: %s\n", s);
+}
+
 void showReady() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x12_tr);
@@ -176,27 +281,106 @@ void showReady() {
   oled.setFont(u8g2_font_6x12_tr);
   oled.drawStr(22, 46, "Tap your card...");
   char line[24];
-  snprintf(line, sizeof(line), "IN:%lu  OUT:%lu", (unsigned long)countIn, (unsigned long)countOut);
+  snprintf(line, sizeof(line), "IN:%lu OUT:%lu", (unsigned long)countIn, (unsigned long)countOut);
   oled.drawStr(0, 63, line);
+  if (wsEnabled) {
+    // สถานะการเชื่อมต่อ backend ให้ช่างดูออกว่าเครื่องหลุด (qN = รายการค้างส่ง)
+    String st = wsBadKey ? "WS:KEY" : wsReady ? "WS:OK" : "WS:--";
+    if (pendingCount) st += " q" + String(pendingCount);
+    oled.drawStr(128 - oled.getStrWidth(st.c_str()), 63, st.c_str());
+  }
   oled.sendBuffer();
 }
 
-void showCard(const String& uid) {
+// หน้าผลแตะบัตร: เลขบัตรตัวใหญ่ + บรรทัดล่างเป็นชื่อ/สถานะจาก server
+void showCard() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x12_tr);
   oled.drawStr(0, 12, mode == MODE_IN ? "Checked IN" : "Checked OUT");
-  oled.drawHLine(0, 15, 128);
-  oled.setFont(u8g2_font_helvB12_tr);
-  oled.drawStr((128 - oled.getStrWidth(uid.c_str())) / 2, 38, uid.c_str());
-  oled.setFont(u8g2_font_6x12_tr);
-  char line[24];
-  snprintf(line, sizeof(line), "#%lu  OK", (unsigned long)(mode == MODE_IN ? countIn : countOut));
-  oled.drawStr(0, 60, line);
   if (timeValid()) {
     String hms = nowText("%H:%M:%S");
-    oled.drawStr(128 - oled.getStrWidth(hms.c_str()), 60, hms.c_str());
+    oled.drawStr(128 - oled.getStrWidth(hms.c_str()), 12, hms.c_str());
   }
+  oled.drawHLine(0, 15, 128);
+  oled.setFont(u8g2_font_helvB12_tr);
+  oled.drawStr((128 - oled.getStrWidth(shownCard.c_str())) / 2, 38, shownCard.c_str());
+  oled.setFont(u8g2_font_6x12_tr);
+  String line;
+  if (!wsEnabled) line = "#" + String(shownCount) + "  OK";
+  else switch (shownStatus) {
+    case RES_WAITING: line = "#" + String(shownCount) + "  Sending..."; break;
+    case RES_NAMED:   line = shownName; break;
+    case RES_UNKNOWN: line = "Unknown card"; break;
+    case RES_ERROR:   line = "Server error"; break;
+    case RES_OFFLINE: line = "Saved (offline)"; break;
+  }
+  while (line.length() && oled.getStrWidth(line.c_str()) > 128) line.remove(line.length() - 1);
+  oled.drawStr((128 - oled.getStrWidth(line.c_str())) / 2, 60, line.c_str());
   oled.sendBuffer();
+}
+
+// name เป็น ASCII เสมอ (ฟอนต์ _tr แสดงไทยไม่ได้) — ไม่มีชื่ออังกฤษใช้รหัสพนักงานแทน
+void applyName(const char* empNo, const char* name) {
+  shownName = *name ? name : empNo;
+  shownStatus = shownName.length() ? RES_NAMED : RES_UNKNOWN;
+  showCard();
+  lastScanAt = millis();  // ได้ผลแล้วโชว์ต่ออีก RESULT_SHOW_MS
+}
+
+void handleWsText(uint8_t* payload, size_t len) {
+  Serial.printf("WS <- %.*s\n", (int)len, (const char*)payload);
+  JsonDocument d;
+  if (deserializeJson(d, payload, len)) return;
+  const char* t = d["t"] | "";
+
+  if (!strcmp(t, "hello_ok")) {
+    wsReady = true;
+    wsBadKey = false;
+    ws.setReconnectInterval(5000);
+    for (byte i = 0; i < pendingCount; i++) pending[i].sentAt = 0;  // ส่งของค้างใหม่ทั้งหมดผ่าน pumpQueue
+    if (!timeValid()) setClockFrom(d["server_time"] | "");
+  } else if (!strcmp(t, "ack")) {
+    // ok / dup / error → เอาออกจากคิวทั้งหมด (error ห้าม resend วนไม่จบ)
+    const char* id = d["id"] | "";
+    removeFromQueue(id);
+    if (!showingResult || !shownIsCard || shownId != id) return;
+    if (!strcmp(d["status"] | "", "error")) {
+      shownStatus = RES_ERROR;  // message จาก server เป็นภาษาไทย แสดงบนจอไม่ได้
+      showCard();
+      lastScanAt = millis();
+    } else {
+      applyName(d["emp_no"] | "", d["name"] | "");
+    }
+  } else if (!strcmp(t, "resolved")) {
+    // มีคนผูกบัตรที่เคยเป็น Unknown — อัปเดตเฉพาะถ้าจอยังแสดงบัตรนี้อยู่
+    if (showingResult && shownIsCard && shownCard == (d["card"] | "")) applyName(d["emp_no"] | "", d["name"] | "");
+  } else if (!strcmp(t, "error")) {
+    // library ไม่บอก close code 4001 แต่ server ส่ง error นี้ก่อนปิดเสมอ — ไม่ต้อง reconnect ถี่
+    const char* code = d["code"] | "";
+    if (!strcmp(code, "bad_key") || !strcmp(code, "bad_device")) {
+      wsBadKey = true;
+      ws.setReconnectInterval(60000);
+    }
+  }
+}
+
+void onWs(WStype_t type, uint8_t* payload, size_t len) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("WS: connected");
+      wsReady = false;
+      sendHello();  // ต้องส่งภายใน 5 วิ ไม่งั้น server ปิด (4002)
+      break;
+    case WStype_DISCONNECTED:
+      Serial.println("WS: disconnected");
+      wsReady = false;
+      break;
+    case WStype_TEXT:
+      handleWsText(payload, len);
+      break;
+    default:
+      break;
+  }
 }
 
 // เลขบัตร 10 หลัก = UID 4 ไบต์ตีเป็นเลขฐานสิบ เติม 0 ข้างหน้าให้ครบ 10 หลัก (เก็บเป็น text เสมอ)
@@ -284,6 +468,18 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   configTime(TZ_BANGKOK, NTP_SERVER_1, NTP_SERVER_2);
 
+  bootId = String(ESP.random(), HEX);
+  if (wsEnabled) {
+    ws.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
+    ws.onEvent(onWs);
+    ws.setReconnectInterval(5000);
+    ws.enableHeartbeat(15000, 3000, 2);  // ping ทุก 15 วิ ไม่ตอบ 2 ครั้ง = ตัดแล้วต่อใหม่
+    Serial.printf("WS: ws://%s:%d%s device=%s boot=%s\n", SERVER_HOST, SERVER_PORT, SERVER_PATH, DEVICE_ID,
+                  bootId.c_str());
+  } else {
+    Serial.println("WS: off (SERVER_HOST empty)");
+  }
+
   oled.begin();
   showReady();
 
@@ -306,8 +502,17 @@ void setup() {
 }
 
 void loop() {
+  if (wsEnabled) {
+    ws.loop();  // ต้องเรียกทุกรอบ — ห้ามเพิ่ม delay() ยาวกว่า ~0.5 วิ ไม่งั้น heartbeat หลุด
+    pumpQueue();
+  }
   pollModeButton();
   logWifi();
+
+  if (showingResult && shownIsCard && wsEnabled && shownStatus == RES_WAITING && millis() - lastScanAt > ACK_WAIT_MS) {
+    shownStatus = RES_OFFLINE;  // ยังอยู่ในคิว จะส่งเองเมื่อต่อได้
+    showCard();
+  }
 
   if (showingResult && millis() - lastScanAt > RESULT_SHOW_MS) {
     showingResult = false;
@@ -338,6 +543,7 @@ void loop() {
     sledIdle();
     lastScanAt = millis();
     showingResult = true;
+    shownIsCard = false;
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
     return;
@@ -349,7 +555,14 @@ void loop() {
   Serial.printf("%s  %s #%lu  %s  (reversed=%s, normal=%s, size=%u)\n", stamp.c_str(), mode == MODE_IN ? "IN" : "OUT",
                 (unsigned long)count, uid.c_str(), uidDecimal(true).c_str(), uidDecimal(false).c_str(), rfid.uid.size);
 
-  showCard(uid);
+  shownIsCard = true;
+  shownCard = uid;
+  shownCount = count;
+  shownStatus = RES_WAITING;
+  shownId = enqueueScan(uid);
+  pumpQueue();  // ส่งทันทีก่อนเสียง/ไฟ ack จะได้กลับมาระหว่างนั้น
+  showingResult = true;
+  showCard();
   sledFill(modeColor(mode));
   beepOk();
   sledFill(0);
