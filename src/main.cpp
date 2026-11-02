@@ -132,11 +132,12 @@ void beepError() {
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, D1, D2);
 
 MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+bool rfidOk = true;  // false = อ่าน RC522 ไม่ได้ หน้ารอจะแสดง error แทน (healthCheck เช็คซ้ำเอง)
 
 const unsigned long RESULT_SHOW_MS = 3000;
 
 // บล็อกบัตรใบเดิมที่แตะซ้ำภายในเวลานี้ (จำได้ล่าสุด RECENT_SIZE ใบ กันกรณีแตะสลับ A-B-A)
-const unsigned long DUPLICATE_BLOCK_MS = 10000;
+const unsigned long DUPLICATE_BLOCK_MS = 2000;
 const byte RECENT_SIZE = 10;
 struct RecentScan { String uid; Mode mode; unsigned long at; };
 RecentScan recent[RECENT_SIZE];
@@ -267,7 +268,18 @@ void setClockFrom(const char* s) {
   Serial.printf("Clock set from server: %s\n", s);
 }
 
+// อ่าน register ของ RC522 ไม่ได้ = สาย SPI/ไฟเลี้ยงมีปัญหา
+void showRfidError() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x12_tr);
+  oled.drawStr(0, 24, "RC522 not found!");
+  oled.drawStr(0, 44, "Check SS=D0 RST=D3");
+  oled.drawStr(0, 58, "SPI D5-D7");
+  oled.sendBuffer();
+}
+
 void showReady() {
+  if (!rfidOk) return showRfidError();
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x12_tr);
   String clock;
@@ -283,12 +295,12 @@ void showReady() {
   char line[24];
   snprintf(line, sizeof(line), "IN:%lu OUT:%lu", (unsigned long)countIn, (unsigned long)countOut);
   oled.drawStr(0, 63, line);
-  if (wsEnabled) {
-    // สถานะการเชื่อมต่อ backend ให้ช่างดูออกว่าเครื่องหลุด (qN = รายการค้างส่ง)
-    String st = wsBadKey ? "WS:KEY" : wsReady ? "WS:OK" : "WS:--";
-    if (pendingCount) st += " q" + String(pendingCount);
-    oled.drawStr(128 - oled.getStrWidth(st.c_str()), 63, st.c_str());
-  }
+  // สถานะการเชื่อมต่อให้ช่างดูออกว่าหลุดที่ Wi-Fi หรือที่ server (qN = รายการค้างส่ง)
+  String st;
+  if (WiFi.status() != WL_CONNECTED) st = "NoWiFi";
+  else if (wsEnabled) st = wsBadKey ? "WS:KEY" : wsReady ? "WS:OK" : "WS:--";
+  if (wsEnabled && pendingCount) st += " q" + String(pendingCount);
+  if (st.length()) oled.drawStr(128 - oled.getStrWidth(st.c_str()), 63, st.c_str());
   oled.sendBuffer();
 }
 
@@ -309,6 +321,17 @@ void drawBig(const String& s) {
   drawCentered(s.substring(sp + 1), 45);
 }
 
+// animation ระหว่างรอ ack: จุด 5 จุด จุดใหญ่วิ่งจากซ้ายไปขวา (loop() วาดใหม่ทุก SENDING_FRAME_MS)
+const unsigned long SENDING_FRAME_MS = 120;
+void drawSending() {
+  byte active = (millis() / SENDING_FRAME_MS) % 5;
+  for (byte i = 0; i < 5; i++) {
+    int x = 40 + i * 12;
+    if (i == active) oled.drawDisc(x, 34, 5);
+    else oled.drawCircle(x, 34, 2);
+  }
+}
+
 // หน้าผลแตะบัตร: รู้ว่าเป็นใคร = ชื่อ (หรือรหัสพนักงาน) ตัวใหญ่
 // ยังไม่รู้ = เลขบัตรตัวใหญ่ไว้ให้คนเอาไปผูกบนหน้า Scans/Events + บรรทัดล่างเป็นสถานะ
 void showCard() {
@@ -323,7 +346,7 @@ void showCard() {
   String big = shownCard, line;
   if (!wsEnabled) line = "#" + String(shownCount) + "  OK";
   else switch (shownStatus) {
-    case RES_WAITING: line = "#" + String(shownCount) + "  Sending..."; break;
+    case RES_WAITING: big = ""; line = "Sending..."; break;  // ไม่โชว์เลขบัตร ใช้ animation แทน
     case RES_NAMED:
       if (shownName.length()) {
         big = shownName;
@@ -337,7 +360,8 @@ void showCard() {
     case RES_ERROR:   line = "Server error"; break;
     case RES_OFFLINE: line = "Saved (offline)"; break;
   }
-  drawBig(big);
+  if (big.length()) drawBig(big);
+  else drawSending();
   oled.setFont(u8g2_font_6x12_tr);
   drawCentered(line, 60);
   oled.sendBuffer();
@@ -424,17 +448,13 @@ String uidDecimal(bool reversed) {
   return String(buf);
 }
 
-void showDuplicate(const String& uid, unsigned long waitMs) {
+// แตะบัตรใบเดิมซ้ำในโหมดเดิมภายใน DUPLICATE_BLOCK_MS
+void showDuplicate() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x12_tr);
   oled.drawStr(0, 12, mode == MODE_IN ? "Already checked IN" : "Already checked OUT");
   oled.drawHLine(0, 15, 128);
-  oled.setFont(u8g2_font_helvB12_tr);
-  oled.drawStr((128 - oled.getStrWidth(uid.c_str())) / 2, 38, uid.c_str());
-  oled.setFont(u8g2_font_6x12_tr);
-  char line[24];
-  snprintf(line, sizeof(line), "Wait %lus", (waitMs + 999) / 1000);
-  oled.drawStr(0, 60, line);
+  drawBig("Please Wait Kub");
   oled.sendBuffer();
 }
 
@@ -470,8 +490,96 @@ void pollModeButton() {
   sledIdle();
 }
 
+// ---- กู้ตัวเองเมื่อเปิดทิ้งไว้นาน ๆ (watchdog ระดับแอป — watchdog ฮาร์ดแวร์ของ ESP8266 เปิดอยู่แล้ว) ----
+const unsigned long WIFI_RETRY_MS = 30000;               // Wi-Fi หลุดนานเกินนี้ = สั่ง begin ใหม่ ทุก ๆ ช่วงนี้
+const unsigned long WIFI_RESTART_MS = 10UL * 60 * 1000;  // Wi-Fi หลุดนานเกินนี้ = restart
+const unsigned long WS_RESTART_MS = 10UL * 60 * 1000;    // มี Wi-Fi แต่ต่อ server ไม่ได้นานเกินนี้ = restart
+const unsigned long HARD_RESTART_MS = 60UL * 60 * 1000;  // มีของค้างในคิว: รอได้ถึงนี้ค่อย restart (คิวหายตอน restart)
+const unsigned long RFID_CHECK_MS = 30000;               // เช็คว่ายังคุยกับ RC522 ได้
+const uint32_t LOW_HEAP_BYTES = 6000;                    // heap เหลือน้อยกว่านี้ = restart ทันที
+
+void restartNow(const char* why) {
+  Serial.printf("Restart: %s (heap=%u queue=%u)\n", why, ESP.getFreeHeap(), pendingCount);
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x12_tr);
+  oled.drawStr(0, 30, "Restarting...");
+  oled.drawStr(0, 46, why);
+  oled.sendBuffer();
+  delay(500);
+  ESP.restart();
+}
+
+void healthCheck() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 1000) return;
+  lastCheck = now;
+
+  if (ESP.getFreeHeap() < LOW_HEAP_BYTES) restartNow("low memory");
+
+  // Wi-Fi: ไม่ฝากไว้กับ auto-reconnect ของ SDK อย่างเดียว เคยค้างที่ status 7 มาแล้ว
+  static unsigned long wifiDownSince = 0, lastRetry = 0;  // 0 = ต่ออยู่
+  static uint16_t retries = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownSince = 0;
+    retries = 0;
+  } else if (!wifiDownSince) {
+    // ห้ามใช้ now | 1 — ถ้าได้ค่ามากกว่า now การลบ unsigned จะติดลบวนเป็นเลขมหาศาล = restart ทันที
+    wifiDownSince = lastRetry = now ? now : 1;
+  } else if (now - lastRetry >= WIFI_RETRY_MS) {
+    lastRetry = now;
+    Serial.printf("WiFi: retry #%u\n", ++retries);
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  // server: นับเฉพาะตอนมี Wi-Fi และ key ไม่ผิด (key ผิด restart ไปก็ไม่หาย)
+  static unsigned long wsDownSince = 0;
+  if (!wsEnabled || wsReady || wsBadKey || WiFi.status() != WL_CONNECTED) wsDownSince = 0;
+  else if (!wsDownSince) wsDownSince = now ? now : 1;
+
+  // restart เฉพาะตอนคิวว่าง ถ้ามีของค้างรอได้ถึง HARD_RESTART_MS และไม่ตัดกลางหน้าผลแตะบัตร
+  const char* why = nullptr;
+  unsigned long stuck = 0;
+  if (wifiDownSince && now - wifiDownSince > WIFI_RESTART_MS) {
+    why = "WiFi down";
+    stuck = now - wifiDownSince;
+  } else if (wsDownSince && now - wsDownSince > WS_RESTART_MS) {
+    why = "Server unreachable";
+    stuck = now - wsDownSince;
+  }
+  if (why && !showingResult && (pendingCount == 0 || stuck > HARD_RESTART_MS)) restartNow(why);
+
+  // RC522: สายหลวม/ไฟกระชากทำให้ชิปหลุดหรือค้าง — init ใหม่เองโดยไม่ต้องถอดปลั๊ก
+  static unsigned long lastRfidCheck = 0;
+  static byte rfidFails = 0;
+  if (showingResult || now - lastRfidCheck < RFID_CHECK_MS) return;
+  lastRfidCheck = now;
+  byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  if (ver == 0x00 || ver == 0xFF) {
+    Serial.printf("RC522: version 0x%02X, re-init\n", ver);
+    rfid.PCD_Init();
+    ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  }
+  if (ver != 0x00 && ver != 0xFF) {
+    rfid.PCD_AntennaOn();  // เผื่อเสาอากาศดับ (ถ้าเปิดอยู่แล้วไม่มีผล)
+    rfidFails = 0;
+    if (!rfidOk) {
+      rfidOk = true;
+      Serial.println("RC522: back");
+      showReady();
+    }
+  } else if (++rfidFails >= 3 && rfidOk) {
+    rfidOk = false;
+    Serial.println("RC522: not found");
+    showReady();
+    beepError();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\nReset reason: %s  heap=%u\n", ESP.getResetReason().c_str(), ESP.getFreeHeap());
   pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -513,13 +621,8 @@ void setup() {
   byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
   Serial.printf("\nRC522 version: 0x%02X\n", ver);
   if (ver == 0x00 || ver == 0xFF) {
-    // อ่าน register ไม่ได้ = สาย SPI/ไฟเลี้ยงมีปัญหา
-    oled.clearBuffer();
-    oled.setFont(u8g2_font_6x12_tr);
-    oled.drawStr(0, 24, "RC522 not found!");
-    oled.drawStr(0, 44, "Check SS=D0 RST=D3");
-    oled.drawStr(0, 58, "SPI D5-D7");
-    oled.sendBuffer();
+    rfidOk = false;  // healthCheck ลอง init ใหม่ทุก 30 วิ
+    showRfidError();
     beepError();
   } else {
     beepOk();
@@ -533,9 +636,18 @@ void loop() {
   }
   pollModeButton();
   logWifi();
+  healthCheck();
 
   if (showingResult && shownIsCard && wsEnabled && shownStatus == RES_WAITING && millis() - lastScanAt > ACK_WAIT_MS) {
     shownStatus = RES_OFFLINE;  // ยังอยู่ในคิว จะส่งเองเมื่อต่อได้
+    showCard();
+  }
+
+  // ขยับ animation "Sending..." ระหว่างรอ ack
+  static unsigned long lastFrameAt = 0;
+  if (showingResult && shownIsCard && wsEnabled && shownStatus == RES_WAITING &&
+      millis() - lastFrameAt >= SENDING_FRAME_MS) {
+    lastFrameAt = millis();
     showCard();
   }
 
@@ -559,7 +671,7 @@ void loop() {
   unsigned long waitMs = blockedFor(uid);
   if (waitMs > 0) {
     Serial.printf("Duplicate %s blocked (%lus left)\n", uid.c_str(), (waitMs + 999) / 1000);
-    showDuplicate(uid, waitMs);
+    showDuplicate();
     sledFill(sled.Color(255, 0, 0));
     beepDuplicate();
     sledFill(0);
