@@ -188,7 +188,7 @@ const unsigned long SEND_GAP_MS = 150;      // server รับไม่เก�
 enum ResultStatus { RES_WAITING, RES_NAMED, RES_UNKNOWN, RES_ERROR, RES_OFFLINE };
 const unsigned long ACK_WAIT_MS = 1500;  // ไม่ได้ ack ภายในนี้ = แสดง Saved (offline)
 bool shownIsCard = false;  // false = จอแสดงผลแตะซ้ำอยู่
-String shownCard, shownId, shownName;
+String shownCard, shownId, shownName, shownEmpNo;  // shownName ว่างได้ (ไม่มีชื่ออังกฤษ)
 ResultStatus shownStatus = RES_WAITING;
 uint32_t shownCount = 0;
 
@@ -292,7 +292,25 @@ void showReady() {
   oled.sendBuffer();
 }
 
-// หน้าผลแตะบัตร: เลขบัตรตัวใหญ่ + บรรทัดล่างเป็นชื่อ/สถานะจาก server
+// ตัดท้ายข้อความให้กว้างไม่เกิน 128 px ด้วยฟอนต์ที่ตั้งอยู่ แล้ววาดกึ่งกลาง
+void drawCentered(String s, int y) {
+  while (s.length() && oled.getStrWidth(s.c_str()) > 128) s.remove(s.length() - 1);
+  oled.drawStr((128 - oled.getStrWidth(s.c_str())) / 2, y, s.c_str());
+}
+
+// ข้อความตัวใหญ่กลางจอ: helvB12 → ไม่พอใช้ helvB10 → ยังไม่พอแยกชื่อ/นามสกุลเป็น 2 บรรทัด
+void drawBig(const String& s) {
+  oled.setFont(u8g2_font_helvB12_tr);
+  if (oled.getStrWidth(s.c_str()) <= 128) return drawCentered(s, 38);
+  oled.setFont(u8g2_font_helvB10_tr);
+  int sp = s.indexOf(' ');
+  if (oled.getStrWidth(s.c_str()) <= 128 || sp < 0) return drawCentered(s, 37);
+  drawCentered(s.substring(0, sp), 31);
+  drawCentered(s.substring(sp + 1), 45);
+}
+
+// หน้าผลแตะบัตร: รู้ว่าเป็นใคร = ชื่อ (หรือรหัสพนักงาน) ตัวใหญ่
+// ยังไม่รู้ = เลขบัตรตัวใหญ่ไว้ให้คนเอาไปผูกบนหน้า Scans/Events + บรรทัดล่างเป็นสถานะ
 void showCard() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x12_tr);
@@ -302,27 +320,34 @@ void showCard() {
     oled.drawStr(128 - oled.getStrWidth(hms.c_str()), 12, hms.c_str());
   }
   oled.drawHLine(0, 15, 128);
-  oled.setFont(u8g2_font_helvB12_tr);
-  oled.drawStr((128 - oled.getStrWidth(shownCard.c_str())) / 2, 38, shownCard.c_str());
-  oled.setFont(u8g2_font_6x12_tr);
-  String line;
+  String big = shownCard, line;
   if (!wsEnabled) line = "#" + String(shownCount) + "  OK";
   else switch (shownStatus) {
     case RES_WAITING: line = "#" + String(shownCount) + "  Sending..."; break;
-    case RES_NAMED:   line = shownName; break;
+    case RES_NAMED:
+      if (shownName.length()) {
+        big = shownName;
+        line = shownEmpNo.length() ? "ID " + shownEmpNo : "Card " + shownCard;
+      } else {
+        big = shownEmpNo;
+        line = "Card " + shownCard;
+      }
+      break;
     case RES_UNKNOWN: line = "Unknown card"; break;
     case RES_ERROR:   line = "Server error"; break;
     case RES_OFFLINE: line = "Saved (offline)"; break;
   }
-  while (line.length() && oled.getStrWidth(line.c_str()) > 128) line.remove(line.length() - 1);
-  oled.drawStr((128 - oled.getStrWidth(line.c_str())) / 2, 60, line.c_str());
+  drawBig(big);
+  oled.setFont(u8g2_font_6x12_tr);
+  drawCentered(line, 60);
   oled.sendBuffer();
 }
 
 // name เป็น ASCII เสมอ (ฟอนต์ _tr แสดงไทยไม่ได้) — ไม่มีชื่ออังกฤษใช้รหัสพนักงานแทน
 void applyName(const char* empNo, const char* name) {
-  shownName = *name ? name : empNo;
-  shownStatus = shownName.length() ? RES_NAMED : RES_UNKNOWN;
+  shownName = name;
+  shownEmpNo = empNo;
+  shownStatus = (*name || *empNo) ? RES_NAMED : RES_UNKNOWN;
   showCard();
   lastScanAt = millis();  // ได้ผลแล้วโชว์ต่ออีก RESULT_SHOW_MS
 }
@@ -559,6 +584,8 @@ void loop() {
   shownCard = uid;
   shownCount = count;
   shownStatus = RES_WAITING;
+  shownName = "";
+  shownEmpNo = "";
   shownId = enqueueScan(uid);
   pumpQueue();  // ส่งทันทีก่อนเสียง/ไฟ ack จะได้กลับมาระหว่างนั้น
   showingResult = true;
